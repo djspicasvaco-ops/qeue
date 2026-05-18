@@ -1,0 +1,78 @@
+{
+  "name": "qeue",
+  "version": "1.0.0",
+  "description": "Karaoke & party host console",
+  "main": "main.js",
+  "author": "Qeue",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:all": "electron-builder --mac --win"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "build": {
+    "appId": "com.qeue.app",
+    "productName": "Qeue",
+    "copyright": "Copyright © 2025 Qeue",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "app/**/*",
+      "assets/**/*",
+      "server.py",
+      "!node_modules",
+      "!dist"
+    ],
+    "extraResources": [
+      {
+        "from": "server.py",
+        "to": "server.py"
+      },
+      {
+        "from": "python-bundled/",
+        "to": "python-bundled/",
+        "filter": ["**/*"]
+      }
+    ],
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["x64", "arm64"] }
+      ],
+      "icon": "assets/icon.icns",
+      "category": "public.app-category.music",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.ico",
+      "publisherName": "Qeue"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Qeue",
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico"
+    },
+    "dmg": {
+      "title": "Install Qeue",
+      "window": { "width": 540, "height": 380 }
+    }
+  }
+}
