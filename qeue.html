@@ -356,7 +356,8 @@
     <button data-v="visuals"><span class="ic">🎬</span> Visuals</button>
     <button data-v="engine"><span class="ic">⚙️</span> Engine</button>
     <button data-v="gview"><span class="ic">📱</span> Guest View</button>
-
+    <button onclick="openTV()" id="tvBtn" style="margin-top:8px;background:linear-gradient(100deg,rgba(255,47,110,.15),rgba(125,92,255,.1));border:1px solid rgba(255,47,110,.3);color:var(--pink)"><span class="ic">📺</span> Open TV</button>
+    <button onclick="toggleTVMode()" id="tvModeBtn" style="margin-top:6px;background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--muted);display:none;align-items:center"><span class="ic" id="tvModeIc">🎬</span> <span id="tvModeTxt">Go Live</span></button>
   </div>
   <div class="ev">
     <label>Event name</label>
@@ -1373,13 +1374,29 @@ function wireVisEditor(id){
 }
 
 /* ---------- nav + drop wiring ---------- */
-document.querySelectorAll('.navi button').forEach(b=>{
+document.querySelectorAll('.navi button[data-v]').forEach(b=>{
   b.onclick=()=>{
-    document.querySelectorAll('.navi button').forEach(x=>x.classList.remove('on'));
+    document.querySelectorAll('.navi button[data-v]').forEach(x=>x.classList.remove('on'));
     b.classList.add('on'); S.view=b.dataset.v; render();
   };
 });
-document.getElementById('addBtn').onclick=()=>document.getElementById('filePick').click();
+document.getElementById('addBtn').onclick = async () => {
+  // Use native Electron dialog if available (installed app)
+  if (window.qeue && window.qeue.showOpenDialog) {
+    const result = await window.qeue.showOpenDialog({
+      title: 'Add Music',
+      buttonLabel: 'Add to Qeue',
+      filters: [{ name: 'Audio', extensions: ['mp3','flac','wav','m4a','ogg','aac'] }],
+      properties: ['openFile', 'multiSelections'],
+    });
+    if (!result.canceled && result.filePaths.length) {
+      // Convert file paths to File objects via input
+      document.getElementById('filePick').click();
+    }
+    return;
+  }
+  document.getElementById('filePick').click();
+};
 document.getElementById('filePick').onchange=e=>addFiles([...e.target.files]);
 document.getElementById('evName').oninput=()=>{if(S.view==='guest')render();};
 function wireDrop(){
@@ -1450,7 +1467,7 @@ function openGuestOverlay() {
   frame.innerHTML = `<iframe src="${url}" style="width:100%;height:100%;border:none;background:#050509"></iframe>`;
   document.getElementById('guestOverlay').classList.add('open');
   // Switch nav to show gview as active but keep overlay open
-  document.querySelectorAll('.navi button').forEach(b => b.classList.remove('on'));
+  document.querySelectorAll('.navi button[data-v]').forEach(b => b.classList.remove('on'));
   document.querySelector('[data-v="gview"]').classList.add('on');
 }
 
@@ -1460,7 +1477,7 @@ function closeGuestOverlay() {
   frame.innerHTML = ''; // release blob URL
   S.view = 'cat';
   render();
-  document.querySelectorAll('.navi button').forEach(b => b.classList.remove('on'));
+  document.querySelectorAll('.navi button[data-v]').forEach(b => b.classList.remove('on'));
   document.querySelector('[data-v="cat"]').classList.add('on');
 }
 
@@ -1628,6 +1645,420 @@ async function engRefreshStems() {
 // Poll engine on load
 setTimeout(engCheckStatus, 1000);
 
-</script>
+/* ================================================================
+   TIMED LYRICS — LRCLIB API
+   Fetches synced lyrics for currently playing track
+================================================================ */
+let lyricsData = null;
+let lyricsTick = null;
+
+async function fetchLyrics(title, artist, duration) {
+  try {
+    const q = encodeURIComponent(`${title} ${artist}`);
+    const r = await fetch(`https://lrclib.net/api/search?q=${q}`);
+    const results = await r.json();
+    if (!results.length) return null;
+    // Find best match with synced lyrics
+    const match = results.find(x => x.syncedLyrics) || results[0];
+    if (!match?.syncedLyrics) return null;
+    return parseLRC(match.syncedLyrics);
+  } catch(e) { return null; }
+}
+
+function parseLRC(lrc) {
+  const lines = lrc.split('\n');
+  const result = [];
+  for (const line of lines) {
+    const m = line.match(/^\[(\d+):(\d+\.\d+)\](.*)/);
+    if (m) {
+      const time = parseInt(m[1]) * 60 + parseFloat(m[2]);
+      result.push({ time, text: m[3].trim() });
+    }
+  }
+  return result.sort((a, b) => a.time - b.time);
+}
+
+function getCurrentLyricIndex(lyrics, currentTime) {
+  let idx = 0;
+  for (let i = 0; i < lyrics.length; i++) {
+    if (lyrics[i].time <= currentTime) idx = i;
+    else break;
+  }
+  return idx;
+}
+
+async function loadLyricsForTrack(tr) {
+  lyricsData = null;
+  if (!tr) return;
+  lyricsData = await fetchLyrics(tr.title, tr.artist, tr.dur);
+  // Push lyrics to TV if open
+  if (tvWin && !tvWin.closed) {
+    tvWin.postMessage({ type: 'LYRICS_LOADED', data: { lyrics: lyricsData } }, '*');
+  }
+}
+
+// Hook into playTrack to load lyrics
+const _origPlayTrack = window.playTrack || playTrack;
+async function playTrackWithLyrics(tr) {
+  await playTrack(tr);
+  loadLyricsForTrack(tr);
+}
+
+// Sync lyrics to TV on audio time update
+audio.addEventListener('timeupdate', () => {
+  if (!lyricsData || !tvWin || tvWin.closed) return;
+  const idx = getCurrentLyricIndex(lyricsData, audio.currentTime);
+  tvWin.postMessage({
+    type: 'LYRIC_SYNC',
+    data: {
+      current: lyricsData[idx]?.text || '',
+      prev: lyricsData[idx - 1]?.text || '',
+      next: lyricsData[idx + 1]?.text || '',
+      time: audio.currentTime,
+    }
+  }, '*');
+});
+
+/* ================================================================
+   TV OUTPUT
+   Embeds full TV page as a blob — no separate file needed
+================================================================ */
+let tvWin = null, tvMode = 'ent';
+
+function openTV() {
+  const html = buildTVPage();
+  const blob = new Blob([html], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  tvWin = window.open(url, 'qeue-tv', 'width=1280,height=720,menubar=no,toolbar=no,location=no,status=no');
+  document.getElementById('tvModeBtn').style.display = 'flex';
+  setTimeout(() => {
+    if (!tvWin || tvWin.closed) return;
+    tvWin.postMessage({ type: 'SET_EVENT', data: { name: document.getElementById('evName').value || 'Karaoke Night' } }, '*');
+    if (S.queue.length) tvWin.postMessage({ type: 'QUEUE_UPDATE', data: { queue: S.queue } }, '*');
+  }, 1200);
+  flash('TV window opened — drag to TV, press F11 for fullscreen');
+}
+
+function toggleTVMode() {
+  if (!tvWin || tvWin.closed) { openTV(); return; }
+  tvMode = tvMode === 'ent' ? 'live' : 'ent';
+  const track = S.queue.length ? { ...S.queue[0] } : (S.nowPlaying ? { ...S.nowPlaying } : null);
+  tvWin.postMessage({ type: 'SET_MODE', data: { mode: tvMode, track } }, '*');
+  if (track && tvMode === 'live' && lyricsData) {
+    tvWin.postMessage({ type: 'LYRICS_LOADED', data: { lyrics: lyricsData } }, '*');
+  }
+  document.getElementById('tvModeIc').textContent = tvMode === 'live' ? '🎭' : '🎬';
+  document.getElementById('tvModeTxt').textContent = tvMode === 'live' ? 'Entertainment Mode' : 'Go Live';
+  document.getElementById('tvModeBtn').style.color = tvMode === 'live' ? 'var(--cyan)' : 'var(--muted)';
+  flash(tvMode === 'live' ? 'TV → Live mode' : 'TV → Entertainment mode');
+}
+
+function buildTVPage() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qeue TV</title>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@700;900&family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#050509;--ink:#f6f5ff;--muted:#8f8dab;--line:rgba(255,255,255,.08);--line2:rgba(255,255,255,.15);
+  --pink:#ff2f6e;--cyan:#27e6df;--violet:#7d5cff;--gold:#ffd166;--green:#3ddc84}
+html,body{width:100%;height:100%;background:var(--bg);overflow:hidden;font-family:'Inter',system-ui,sans-serif;color:var(--ink);user-select:none}
+#bgCanvas{position:fixed;inset:0;z-index:0}
+#bgDim{position:fixed;inset:0;z-index:1;background:rgba(5,5,9,.45);pointer-events:none}
+.mode{position:fixed;inset:0;z-index:10;opacity:0;pointer-events:none;transition:opacity .6s}
+.mode.show{opacity:1;pointer-events:auto}
+
+/* ENT MODE */
+#mEnt{display:grid;grid-template-columns:1fr 400px;height:100%}
+#entLeft{display:flex;flex-direction:column;justify-content:center;padding:64px 60px}
+#bigClock{font-family:'Unbounded',sans-serif;font-size:clamp(64px,12vw,148px);font-weight:900;letter-spacing:-.06em;line-height:1;
+  background:linear-gradient(135deg,var(--pink),var(--violet),var(--cyan));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:8px}
+#bigDate{font-size:16px;color:var(--muted);font-weight:600;letter-spacing:.12em;text-transform:uppercase;margin-bottom:44px}
+.brand-row{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+.brand-name{font-family:'Unbounded',sans-serif;font-size:20px;font-weight:900;letter-spacing:-.03em}
+.eq{display:inline-flex;align-items:flex-end;gap:3px;height:15px}
+.eq i{width:3px;border-radius:2px;animation:bar .9s ease-in-out infinite}
+.eq i:nth-child(1){height:45%;background:var(--pink)}
+.eq i:nth-child(2){height:90%;background:var(--cyan);animation-delay:-.3s}
+.eq i:nth-child(3){height:60%;background:var(--violet);animation-delay:-.6s}
+.eq i:nth-child(4){height:100%;background:var(--gold);animation-delay:-.15s}
+@keyframes bar{0%,100%{transform:scaleY(.3)}50%{transform:scaleY(1)}}
+#entEvName{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.1em;text-transform:uppercase;margin-bottom:44px}
+#factCard{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:26px 30px;max-width:540px}
+.fact-eyebrow{font-size:10px;font-weight:800;letter-spacing:.14em;color:var(--cyan);text-transform:uppercase;
+  display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.fact-dot{width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:glow 1.4s ease-in-out infinite}
+@keyframes glow{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.2;transform:scale(.7)}}
+#factText{font-size:17px;color:rgba(255,255,255,.72);line-height:1.7;font-weight:500;transition:opacity .35s}
+#factText.fade{opacity:0}
+#factSource{font-size:11px;color:var(--muted);margin-top:10px;font-weight:600;font-style:italic}
+
+#entRight{background:rgba(5,5,9,.78);border-left:1px solid var(--line);
+  backdrop-filter:blur(28px);-webkit-backdrop-filter:blur(28px);display:flex;flex-direction:column;overflow:hidden}
+#qHead{padding:28px 22px 16px;border-bottom:1px solid var(--line);flex-shrink:0}
+#qHead h2{font-family:'Unbounded',sans-serif;font-size:13px;font-weight:900;letter-spacing:.04em}
+#qHead p{font-size:12px;color:var(--muted);margin-top:4px}
+#qNowWrap{flex-shrink:0;padding:16px 22px;
+  background:linear-gradient(135deg,rgba(255,47,110,.1),rgba(125,92,255,.07));
+  border-bottom:1px solid rgba(255,47,110,.2);display:none}
+#qNowWrap.show{display:block}
+.now-lbl{font-size:10px;font-weight:800;letter-spacing:.14em;color:var(--pink);display:flex;align-items:center;gap:7px;margin-bottom:8px}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--pink);animation:glow 1s ease-in-out infinite}
+#qNowRow{display:flex;align-items:center;gap:12px}
+.q-thumb{width:44px;height:44px;border-radius:10px;background:linear-gradient(135deg,#1a1a2e,#0d0d1a);
+  overflow:hidden;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:16px}
+.q-thumb img{width:100%;height:100%;object-fit:cover}
+.q-meta .q-t{font-size:14px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+.q-meta .q-by{font-size:11px;color:var(--muted);margin-top:2px}
+#qUpNext{flex:1;overflow-y:auto;padding:8px 0}
+#qUpNext::-webkit-scrollbar{width:3px}
+#qUpNext::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:2px}
+.q-row{display:flex;align-items:center;gap:12px;padding:11px 22px;border-bottom:1px solid var(--line)}
+.q-pos{font-family:'Unbounded',sans-serif;font-size:14px;font-weight:900;color:var(--cyan);width:18px;text-align:center;flex-shrink:0}
+.q-row .q-t{font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.q-row .q-by{font-size:11px;color:var(--muted);margin-top:1px}
+.q-empty{padding:40px 22px;text-align:center;color:var(--muted);font-size:13px}
+#qScanWrap{flex-shrink:0;padding:18px 22px;border-top:1px solid var(--line);text-align:center}
+#qScanWrap p{font-size:11px;color:var(--muted);margin-bottom:10px;font-weight:600}
+#qrBox{width:110px;height:110px;background:#fff;border-radius:10px;margin:0 auto 8px;display:flex;align-items:center;justify-content:center}
+#qrUrl{font-size:10px;color:var(--cyan);word-break:break-all;font-weight:700}
+
+/* LIVE MODE */
+#mLive{display:grid;grid-template-columns:1fr 360px;height:100%}
+#liveLeft{display:flex;flex-direction:column;justify-content:flex-end;padding:0 60px 60px;
+  background:linear-gradient(0deg,rgba(5,5,9,.92) 0%,rgba(5,5,9,.3) 50%,transparent 100%)}
+#liveTop{position:fixed;top:0;left:0;right:360px;z-index:11;padding:28px 48px 50px;
+  background:linear-gradient(180deg,rgba(5,5,9,.88) 0%,transparent 100%);
+  display:flex;align-items:center;gap:18px}
+#ltArt{width:64px;height:64px;border-radius:12px;background:linear-gradient(135deg,#1a1a2e,#0d0d1a);
+  overflow:hidden;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:24px;border:1px solid var(--line2)}
+#ltArt img{width:100%;height:100%;object-fit:cover}
+#ltTitle{font-family:'Unbounded',sans-serif;font-size:22px;font-weight:900;letter-spacing:-.03em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#ltArtist{font-size:13px;color:var(--muted);margin-top:3px}
+#ltSinger{margin-left:auto;flex-shrink:0;background:rgba(255,47,110,.15);border:1px solid rgba(255,47,110,.4);
+  color:var(--pink);font-size:12px;font-weight:800;padding:8px 18px;border-radius:100px;
+  display:flex;align-items:center;gap:8px;letter-spacing:.06em}
+.mic-dot{width:7px;height:7px;border-radius:50%;background:var(--pink);animation:glow 1s ease-in-out infinite}
+#lyricPast{font-size:20px;font-weight:600;color:rgba(255,255,255,.25);margin-bottom:12px;min-height:28px;transition:opacity .3s}
+#lyricNow{font-family:'Unbounded',sans-serif;font-size:clamp(24px,4vw,52px);font-weight:900;
+  color:#fff;line-height:1.2;letter-spacing:-.03em;margin-bottom:12px;min-height:60px;transition:opacity .2s}
+#lyricNow .hi{color:var(--pink)}
+#lyricNext{font-size:18px;font-weight:600;color:rgba(255,255,255,.25);min-height:26px;transition:opacity .3s}
+#liveProgress{position:fixed;bottom:0;left:0;right:360px;height:4px;background:rgba(255,255,255,.07);z-index:11}
+#liveFill{height:100%;width:0;background:linear-gradient(90deg,var(--pink),var(--violet));transition:width .3s linear}
+#liveRight{background:rgba(5,5,9,.8);border-left:1px solid var(--line);
+  backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);display:flex;flex-direction:column;overflow:hidden;padding-top:120px}
+.live-q-head{padding:16px 20px 12px;border-bottom:1px solid var(--line);flex-shrink:0}
+.live-q-head h3{font-family:'Unbounded',sans-serif;font-size:12px;font-weight:900;letter-spacing:.04em}
+#liveQList{flex:1;overflow-y:auto;padding:6px 0}
+#liveQList::-webkit-scrollbar{width:3px}
+#liveQList::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:2px}
+.no-lyrics{color:var(--muted);font-size:14px;font-style:italic}
+</style>
+</head>
+<body>
+<canvas id="bgCanvas"></canvas>
+<div id="bgDim"></div>
+
+<!-- ENTERTAINMENT MODE -->
+<div class="mode show" id="mEnt">
+  <div id="entLeft">
+    <div id="bigClock">00:00</div>
+    <div id="bigDate">Tonight</div>
+    <div class="brand-row"><div class="eq"><i></i><i></i><i></i><i></i></div><div class="brand-name">Qeue</div></div>
+    <div id="entEvName">Karaoke Night</div>
+    <div id="factCard">
+      <div class="fact-eyebrow"><span class="fact-dot"></span><span id="factEyebrow">Did you know?</span></div>
+      <div id="factText">Loading…</div>
+      <div id="factSource"></div>
+    </div>
+  </div>
+  <div id="entRight">
+    <div id="qHead"><h2>Up next tonight</h2><p id="qHeadSub">Queue is filling up…</p></div>
+    <div id="qNowWrap">
+      <div class="now-lbl"><span class="live-dot"></span>NOW SINGING</div>
+      <div id="qNowRow">
+        <div class="q-thumb" id="qNowThumb">🎵</div>
+        <div class="q-meta"><div class="q-t" id="qNowTitle">—</div><div class="q-by" id="qNowBy">—</div></div>
+      </div>
+    </div>
+    <div id="qUpNext"><div class="q-empty">Nobody in queue yet — scan to add!</div></div>
+    <div id="qScanWrap"><p>Scan to pick your song</p><div id="qrBox"></div><div id="qrUrl"></div></div>
+  </div>
+</div>
+
+<!-- LIVE SINGING MODE -->
+<div class="mode" id="mLive">
+  <div id="liveTop">
+    <div id="ltArt"><span>🎵</span></div>
+    <div><div id="ltTitle">—</div><div id="ltArtist">—</div></div>
+    <div id="ltSinger"><span class="mic-dot"></span><span id="ltSingerName">—</span></div>
+  </div>
+  <div id="liveLeft">
+    <div id="lyricPast"></div>
+    <div id="lyricNow"><span class="hi">—</span></div>
+    <div id="lyricNext"></div>
+  </div>
+  <div id="liveRight">
+    <div class="live-q-head"><h3>Up next</h3></div>
+    <div id="liveQList"><div class="q-empty">Queue empty</div></div>
+  </div>
+  <div id="liveProgress"><div id="liveFill"></div></div>
+</div>
+
+<script>
+/* BG BEAT CANVAS */
+const cv=document.getElementById('bgCanvas');
+const ctx2=cv.getContext('2d');
+let t2=0,theme2=0;
+const themes2=[
+  t=>{ctx2.fillStyle='rgba(5,5,9,0.1)';ctx2.fillRect(0,0,cv.width,cv.height);for(let i=0;i<5;i++){const x=cv.width/2+Math.cos(t*.6+i*1.26)*cv.width*.38,y=cv.height/2+Math.sin(t*.4+i*1.26)*cv.height*.38,r=80+Math.sin(t*1.8+i)*50,g=ctx2.createRadialGradient(x,y,0,x,y,r),c=['#ff2f6e','#7d5cff','#27e6df','#ffd166','#3ddc84'][i];g.addColorStop(0,c+'55');g.addColorStop(1,'transparent');ctx2.fillStyle=g;ctx2.beginPath();ctx2.arc(x,y,r,0,Math.PI*2);ctx2.fill();}},
+  t=>{ctx2.fillStyle='rgba(5,5,9,0.14)';ctx2.fillRect(0,0,cv.width,cv.height);const bars=72,bw=cv.width/bars;for(let i=0;i<bars;i++){const h=(Math.sin(t*2+i*.28)*.5+.5)*cv.height*.65+20;ctx2.fillStyle='hsla('+(((i/bars*120+t*18)%360))+',85%,58%,0.75)';ctx2.fillRect(i*bw+2,cv.height-h,bw-4,h);}},
+  t=>{ctx2.fillStyle='rgba(5,5,9,0.16)';ctx2.fillRect(0,0,cv.width,cv.height);[['#ff2f6e',3],['#7d5cff',2],['#27e6df',1.5]].forEach(([c,lw],wi)=>{ctx2.beginPath();ctx2.strokeStyle=c+'88';ctx2.lineWidth=lw;for(let x=0;x<cv.width;x++){const y=cv.height/2+Math.sin(x/cv.width*Math.PI*8+t*2.2+wi*1.3)*cv.height*.18+Math.sin(x/cv.width*Math.PI*14+t*3.4+wi)*cv.height*.07;x===0?ctx2.moveTo(x,y):ctx2.lineTo(x,y);}ctx2.stroke();});}
+];
+function resizeCV(){cv.width=innerWidth;cv.height=innerHeight;}
+resizeCV();window.addEventListener('resize',resizeCV);
+setInterval(()=>{theme2=(theme2+1)%themes2.length;},28000);
+(function loop(){requestAnimationFrame(loop);themes2[theme2](t2);t2+=.022;})();
+
+/* CLOCK */
+function updateClock(){
+  const n=new Date(),h=String(n.getHours()).padStart(2,'0'),m=String(n.getMinutes()).padStart(2,'0');
+  document.getElementById('bigClock').textContent=h+':'+m;
+  const days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  document.getElementById('bigDate').textContent=days[n.getDay()]+' · '+n.getDate()+' '+months[n.getMonth()];
+}
+updateClock();setInterval(updateClock,10000);
+
+/* FACTS */
+const FACTS=[
+  {text:"Freddie Mercury believed his slightly unusual jaw gave him an extra octave of vocal range — he refused to have his teeth fixed for his entire career.",artist:"Queen"},
+  {text:"Michael Jackson invented a special shoe with a nail in the heel to lean at a 45-degree angle on stage. The move was patented in 1992.",artist:"Michael Jackson"},
+  {text:"Elvis Presley was naturally blond. He dyed his hair black to look more dramatic on stage and never went back.",artist:"Elvis Presley"},
+  {text:"The Beatles were rejected by Decca Records in 1962. The label said guitar groups are on the way out. They signed with EMI weeks later.",artist:"The Beatles"},
+  {text:"Whitney Houston's voice was so powerful that engineers had to place the mic further away than standard during recording sessions to avoid distortion.",artist:"Whitney Houston"},
+  {text:"ABBA calculated that Dancing Queen was earning them roughly one dollar every second somewhere in the world — and that was in 1980.",artist:"ABBA"},
+  {text:"David Bowie created Ziggy Stardust partly inspired by a Japanese street mime he saw in 1971. The mime never knew he inspired one of rock's biggest personas.",artist:"David Bowie"},
+  {text:"Aretha Franklin could play piano entirely by ear from the age of 5 and never learned to read sheet music.",artist:"Aretha Franklin"},
+  {text:"Prince played 27 instruments on his debut album. He was 19 years old.",artist:"Prince"},
+  {text:"Bob Marley's final words to his son Ziggy were: Money can't buy life. He died from cancer at 36.",artist:"Bob Marley"},
+  {text:"Dolly Parton once entered a Dolly Parton lookalike contest — and came last.",artist:"Dolly Parton"},
+  {text:"Beyoncé trademarked her daughter Blue Ivy's name within 72 hours of birth to prevent merchandise being sold without permission.",artist:"Beyoncé"},
+  {text:"Madonna was fired from Dunkin' Donuts during her first year in New York for squirting jam on a customer.",artist:"Madonna"},
+  {text:"Eminem can rap roughly 11 syllables per second. His fastest track peaks at 97 words in 15 seconds.",artist:"Eminem"},
+  {text:"Tina Turner holds the record for the largest paying concert audience — 180,000 people in Rio de Janeiro in 1988.",artist:"Tina Turner"},
+  {text:"Adele once sent a fan a handwritten apology letter after accidentally hitting them with a microphone stand on stage.",artist:"Adele"},
+  {text:"Bruno Mars started performing in clubs in Honolulu at the age of 4, billed as the world's youngest Elvis impersonator.",artist:"Bruno Mars"},
+  {text:"Ed Sheeran has a Heinz Ketchup tattoo on his arm because he eats it on everything. Heinz later put his face on a bottle.",artist:"Ed Sheeran"},
+  {text:"Frank Sinatra was once offered the lead role in Die Hard. He was in his 70s at the time and turned it down.",artist:"Frank Sinatra"},
+  {text:"Led Zeppelin once rode horses through a hotel lobby in Tucson. The hotel sent a bill. They paid it without question.",artist:"Led Zeppelin"},
+];
+let factIdx=0,tvQueue=[];
+function showFact(){
+  const artists=tvQueue.map(q=>(q.artist||'').toLowerCase());
+  const matched=FACTS.filter(f=>artists.some(a=>a.includes((f.artist||'').toLowerCase().split(' ')[0])));
+  const pool=matched.length?matched:FACTS;
+  const el=document.getElementById('factText');
+  el.classList.add('fade');
+  setTimeout(()=>{
+    const f=pool[factIdx%pool.length];factIdx++;
+    el.textContent=f.text;
+    document.getElementById('factSource').textContent=f.artist?'— '+f.artist:'';
+    document.getElementById('factEyebrow').lastChild.textContent=matched.length?"About tonight's artists":'Did you know?';
+    el.classList.remove('fade');
+  },380);
+}
+showFact();setInterval(showFact,9000);
+
+/* TIMED LYRICS */
+let lyrics=null;
+function setLyrics(data){lyrics=data;}
+function syncLyric(data){
+  document.getElementById('lyricPast').textContent=data.prev||'';
+  document.getElementById('lyricNow').innerHTML=data.current?`<span class="hi">${esc(data.current)}</span>`:'<span class="hi">♪</span>';
+  document.getElementById('lyricNext').textContent=data.next||'';
+}
+
+/* QUEUE RENDER */
+function renderTVQueue(q){
+  tvQueue=q||[];
+  const sub=document.getElementById('qHeadSub');
+  sub.textContent=tvQueue.length?tvQueue.length+(tvQueue.length===1?' person':' people')+' in queue':'Be the first to sing!';
+  const nw=document.getElementById('qNowWrap');
+  if(tvQueue.length){
+    nw.classList.add('show');
+    document.getElementById('qNowTitle').textContent=tvQueue[0].title||'Unknown';
+    document.getElementById('qNowBy').textContent='🎤 '+(tvQueue[0].by||'Guest');
+    document.getElementById('qNowThumb').innerHTML=tvQueue[0].picture?`<img src="${tvQueue[0].picture}">`:'🎵';
+  }else{nw.classList.remove('show');}
+  const rest=tvQueue.slice(1);
+  document.getElementById('qUpNext').innerHTML=rest.length?rest.map((q,i)=>`<div class="q-row"><span class="q-pos">${i+1}</span><div class="q-thumb">${q.picture?`<img src="${q.picture}">`:'🎵'}</div><div class="q-meta"><div class="q-t">${esc(q.title||'Unknown')}</div><div class="q-by">${esc(q.by||'Guest')}</div></div></div>`).join(''):'<div class="q-empty">Nobody waiting yet</div>';
+  document.getElementById('liveQList').innerHTML=rest.length?rest.map((q,i)=>`<div class="q-row"><span class="q-pos">${i+1}</span><div class="q-thumb">${q.picture?`<img src="${q.picture}">`:'🎵'}</div><div class="q-meta"><div class="q-t">${esc(q.title||'Unknown')}</div><div class="q-by">${esc(q.by||'Guest')}</div></div></div>`).join(''):'<div class="q-empty">Nobody waiting</div>';
+}
+
+/* MODE SWITCH */
+window.addEventListener('message',e=>{
+  const {type,data}=e.data||{};
+  if(type==='SET_MODE'){
+    document.getElementById('mEnt').classList.toggle('show',data.mode==='ent');
+    document.getElementById('mLive').classList.toggle('show',data.mode==='live');
+    if(data.mode==='live'&&data.track)showLive(data.track);
+  }
+  if(type==='SET_EVENT') document.getElementById('entEvName').textContent=data.name||'Karaoke Night';
+  if(type==='QUEUE_UPDATE') renderTVQueue(data.queue);
+  if(type==='LYRICS_LOADED'){lyrics=data.lyrics;if(!lyrics)document.getElementById('lyricNow').innerHTML='<span class="no-lyrics">No synced lyrics found</span>';}
+  if(type==='LYRIC_SYNC') syncLyric(data);
+});
+
+function showLive(track){
+  document.getElementById('ltTitle').textContent=track.title||'—';
+  document.getElementById('ltArtist').textContent=track.artist||'—';
+  document.getElementById('ltSingerName').textContent=track.by||'Guest';
+  document.getElementById('ltArt').innerHTML=track.picture?`<img src="${track.picture}">`:'<span>🎵</span>';
+  document.getElementById('lyricNow').innerHTML='<span class="hi">Loading lyrics…</span>';
+  document.getElementById('lyricPast').textContent='';
+  document.getElementById('lyricNext').textContent='';
+  startProgress();
+}
+
+let pt=null;
+function startProgress(){
+  if(pt)clearInterval(pt);let v=0;
+  document.getElementById('liveFill').style.width='0%';
+  pt=setInterval(()=>{v=Math.min(100,v+0.12);document.getElementById('liveFill').style.width=v+'%';if(v>=100)clearInterval(pt);},300);
+}
+
+function esc(s){return(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+/* QR */
+function renderQR(url){
+  document.getElementById('qrUrl').textContent=url;
+  const box=document.getElementById('qrBox');
+  if(!window.QRCode){
+    const s=document.createElement('script');
+    s.src='https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+    s.onload=()=>{box.innerHTML='';try{new QRCode(box,{text:url,width:100,height:100,colorDark:'#050509',colorLight:'#fff'});}catch(e){}};
+    document.head.appendChild(s);
+  }else{box.innerHTML='';try{new QRCode(box,{text:url,width:100,height:100,colorDark:'#050509',colorLight:'#fff'});}catch(e){}}
+}
+
+/* INIT */
+try{
+  fetch('http://127.0.0.1:7842/api/health').then(r=>r.json()).then(d=>{
+    if(d.ip)renderQR('http://'+d.ip+':7842/guest');
+  }).catch(()=>{});
+  fetch('http://127.0.0.1:7842/api/queue').then(r=>r.json()).then(q=>renderTVQueue(q)).catch(()=>{});
+}catch(e){}
+<\/script>
+</body>
+</html>`;
+}
+
 </body>
 </html>

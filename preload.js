@@ -5,5 +5,6 @@ contextBridge.exposeInMainWorld('qeue', {
   getServerPort: () => ipcRenderer.invoke('get-server-port'),
   isServerReady: () => ipcRenderer.invoke('is-server-ready'),
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+  showOpenDialog: (opts) => ipcRenderer.invoke('show-open-dialog', opts),
   onServerReady: (cb) => ipcRenderer.on('server-ready', cb),
 });
