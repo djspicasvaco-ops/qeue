@@ -38,6 +38,33 @@ function startServer() {
   const py = getPythonPath();
   const script = getServerScriptPath();
 
+  if (!fs.existsSync(script)) {
+    console.log('[server] no server.py found, running without engine');
+    return;
+  }
+
+  try {
+    serverProcess = spawn(py, [script, '--port', SERVER_PORT], {
+      cwd: path.dirname(script),
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    serverProcess.on('error', (e) => {
+      console.log('[server] could not start:', e.message);
+      serverProcess = null;
+    });
+    serverProcess.stdout.on('data', d => console.log('[server]', d.toString().trim()));
+    serverProcess.stderr.on('data', d => console.error('[server]', d.toString().trim()));
+    serverProcess.on('exit', code => { serverReady = false; });
+    pollServer();
+  } catch(e) {
+    console.log('[server] spawn failed:', e.message);
+  }
+}
+  const py = getPythonPath();
+  const script = getServerScriptPath();
+
   serverProcess = spawn(py, [script, '--port', SERVER_PORT], {
     cwd: path.dirname(script),
     env: { ...process.env, PYTHONUNBUFFERED: '1' },
