@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, ipcMain } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const http = require('http');
@@ -12,101 +12,77 @@ let serverReady = false;
 
 const SERVER_PORT = 7842;
 const IS_MAC = process.platform === 'darwin';
-const IS_WIN = process.platform === 'win32';
 
-// ── Python server path ──
 function getPythonPath() {
-  const bundled = path.join(process.resourcesPath, 'python-bundled');
-  if (IS_WIN) {
+  const bundled = path.join(process.resourcesPath || __dirname, 'python-bundled');
+  if (process.platform === 'win32') {
     const exe = path.join(bundled, 'python', 'python.exe');
     if (fs.existsSync(exe)) return exe;
-  } else {
-    const bin = path.join(bundled, 'bin', 'python3');
-    if (fs.existsSync(bin)) return bin;
+    return 'python';
   }
-  return IS_WIN ? 'python' : 'python3';
+  const bin = path.join(bundled, 'bin', 'python3');
+  if (fs.existsSync(bin)) return bin;
+  return 'python3';
 }
 
 function getServerScriptPath() {
-  const bundled = path.join(process.resourcesPath, 'server.py');
+  const bundled = path.join(process.resourcesPath || __dirname, 'server.py');
   if (fs.existsSync(bundled)) return bundled;
   return path.join(__dirname, 'server.py');
 }
 
-// ── Start Python server ──
 function startServer() {
-  const py = getPythonPath();
   const script = getServerScriptPath();
-
   if (!fs.existsSync(script)) {
     console.log('[server] no server.py found, running without engine');
     return;
   }
-
+  const py = getPythonPath();
   try {
-    serverProcess = spawn(py, [script, '--port', SERVER_PORT], {
+    serverProcess = spawn(py, [script, '--port', String(SERVER_PORT)], {
       cwd: path.dirname(script),
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      env: Object.assign({}, process.env, { PYTHONUNBUFFERED: '1' }),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
-    serverProcess.on('error', (e) => {
+    serverProcess.on('error', function(e) {
       console.log('[server] could not start:', e.message);
       serverProcess = null;
     });
-    serverProcess.stdout.on('data', d => console.log('[server]', d.toString().trim()));
-    serverProcess.stderr.on('data', d => console.error('[server]', d.toString().trim()));
-    serverProcess.on('exit', code => { serverReady = false; });
-    pollServer();
+    serverProcess.stdout.on('data', function(d) { console.log('[server]', d.toString().trim()); });
+    serverProcess.stderr.on('data', function(d) { console.error('[server]', d.toString().trim()); });
+    serverProcess.on('exit', function() { serverReady = false; });
+    pollServer(0);
   } catch(e) {
     console.log('[server] spawn failed:', e.message);
   }
 }
-  const py = getPythonPath();
-  const script = getServerScriptPath();
 
-  serverProcess = spawn(py, [script, '--port', SERVER_PORT], {
-    cwd: path.dirname(script),
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
-
-  serverProcess.stdout.on('data', d => console.log('[server]', d.toString().trim()));
-  serverProcess.stderr.on('data', d => console.error('[server]', d.toString().trim()));
-  serverProcess.on('exit', code => {
-    console.log('[server] exited with code', code);
-    serverReady = false;
-  });
-
-  pollServer();
-}
-
-function pollServer(attempts = 0) {
-  if (attempts > 30) return;
-  http.get(`http://127.0.0.1:${SERVER_PORT}/api/health`, res => {
+function pollServer(attempts) {
+  if (attempts > 20) return;
+  http.get('http://127.0.0.1:' + SERVER_PORT + '/api/health', function(res) {
     if (res.statusCode === 200) {
       serverReady = true;
-      console.log('[server] ready on port', SERVER_PORT);
+      console.log('[server] ready');
       if (win) win.webContents.send('server-ready');
     }
-  }).on('error', () => {
-    setTimeout(() => pollServer(attempts + 1), 2000);
+  }).on('error', function() {
+    setTimeout(function() { pollServer(attempts + 1); }, 2000);
   });
 }
 
-// ── Get local WiFi IP ──
 function getLocalIP() {
   const ifaces = os.networkInterfaces();
-  for (const name of Object.keys(ifaces)) {
-    for (const iface of ifaces[name]) {
-      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+  const keys = Object.keys(ifaces);
+  for (let i = 0; i < keys.length; i++) {
+    const list = ifaces[keys[i]];
+    for (let j = 0; j < list.length; j++) {
+      if (list[j].family === 'IPv4' && !list[j].internal) return list[j].address;
     }
   }
   return '127.0.0.1';
 }
 
-// ── Create main window ──
 function createWindow() {
   win = new BrowserWindow({
     width: 1280,
@@ -115,8 +91,6 @@ function createWindow() {
     minHeight: 600,
     title: 'Qeue',
     backgroundColor: '#050509',
-    titleBarStyle: IS_MAC ? 'hiddenInset' : 'default',
-    frame: !IS_MAC,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -125,82 +99,58 @@ function createWindow() {
     show: false,
   });
 
-  // Show loading screen first, then the app
   win.loadFile(path.join(__dirname, 'app', 'loading.html'));
 
-  win.once('ready-to-show', () => {
+  win.once('ready-to-show', function() {
     win.show();
-    // After a short delay, load the main app
-    setTimeout(() => {
+    setTimeout(function() {
       win.loadFile(path.join(__dirname, 'app', 'index.html'));
-    }, IS_WIN ? 1800 : 1200);
+    }, 1500);
   });
 
-  win.on('closed', () => { win = null; });
+  win.on('closed', function() { win = null; });
 
-  // Open external links in default browser
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http')) shell.openExternal(url);
+  win.webContents.setWindowOpenHandler(function(details) {
+    if (details.url.startsWith('http')) shell.openExternal(details.url);
     return { action: 'deny' };
   });
 }
 
-// ── Tray icon ──
 function createTray() {
-  const iconPath = path.join(__dirname, 'assets', IS_MAC ? 'tray-mac.png' : 'tray-win.png');
-  const img = fs.existsSync(iconPath)
-    ? nativeImage.createFromPath(iconPath)
-    : nativeImage.createEmpty();
-
+  var img = nativeImage.createEmpty();
   tray = new Tray(img);
   tray.setToolTip('Qeue');
-
-  const menu = Menu.buildFromTemplate([
-    { label: 'Open Qeue', click: () => { if (win) win.show(); else createWindow(); } },
+  var menu = Menu.buildFromTemplate([
+    { label: 'Open Qeue', click: function() { if (win) win.show(); else createWindow(); } },
     { type: 'separator' },
-    { label: `Guest link: http://${getLocalIP()}:${SERVER_PORT}/guest`, enabled: false },
-    { label: 'Copy guest link', click: () => {
-      require('electron').clipboard.writeText(`http://${getLocalIP()}:${SERVER_PORT}/guest`);
-    }},
-    { type: 'separator' },
-    { label: 'Quit Qeue', click: () => { app.isQuitting = true; app.quit(); } },
+    { label: 'Quit', click: function() { app.isQuitting = true; app.quit(); } },
   ]);
-
   tray.setContextMenu(menu);
-  tray.on('double-click', () => { if (win) win.show(); });
+  tray.on('double-click', function() { if (win) win.show(); });
 }
 
-// ── IPC handlers ──
-ipcMain.handle('get-local-ip', () => getLocalIP());
-ipcMain.handle('get-server-port', () => SERVER_PORT);
-ipcMain.handle('is-server-ready', () => serverReady);
-ipcMain.handle('get-app-version', () => app.getVersion());
+ipcMain.handle('get-local-ip', function() { return getLocalIP(); });
+ipcMain.handle('get-server-port', function() { return SERVER_PORT; });
+ipcMain.handle('is-server-ready', function() { return serverReady; });
+ipcMain.handle('get-app-version', function() { return app.getVersion(); });
 
-// ── App lifecycle ──
-app.whenReady().then(() => {
+app.whenReady().then(function() {
   createWindow();
   createTray();
   startServer();
-
-  app.on('activate', () => {
+  app.on('activate', function() {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
-app.on('window-all-closed', () => {
+app.on('window-all-closed', function() {
   if (!IS_MAC) app.quit();
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', function() {
   app.isQuitting = true;
   if (serverProcess) {
     serverProcess.kill();
     serverProcess = null;
   }
-});
-
-// Prevent quitting on window close (mac style — minimize to tray)
-app.on('window-all-closed', (e) => {
-  if (!app.isQuitting) return;
-  if (serverProcess) serverProcess.kill();
 });
